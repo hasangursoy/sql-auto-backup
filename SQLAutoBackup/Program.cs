@@ -5,6 +5,7 @@ using System.Data.SqlClient;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using Ionic.Zip;
@@ -14,25 +15,35 @@ namespace SQLAutoBackup
 {
 	internal class Program
 	{
+		private static bool SentryEnabled
+			=> !string.IsNullOrEmpty(ConfigurationManager.AppSettings["SentryDSN"]);
+
+		private static bool SuccessMessages
+			=> !string.IsNullOrEmpty(ConfigurationManager.AppSettings["SuccessMessages"]) && Convert.ToBoolean(ConfigurationManager.AppSettings["SuccessMessages"]);
+
+		private static string MachineName
+			=> Environment.MachineName;
+
 		private static void Main()
 		{
-			using (SentrySdk.Init(ConfigurationManager.AppSettings["SentryDSN"]))
+			//"The underlying connection was closed: An unexpected error occurred on a send." error fix
+			ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls11 | SecurityProtocolType.Tls12;
+
+			Console.WriteLine($"CONFIG {{ MachineName: {MachineName}, SentryEnabled: {SentryEnabled}, SuccessMessages: {SuccessMessages} }}");
+
+			using (SentryEnabled ? SentrySdk.Init(ConfigurationManager.AppSettings["SentryDSN"]) : null)
 			{
-				var successMessages = true;
-				if (!string.IsNullOrEmpty(ConfigurationManager.AppSettings["SuccessMessages"]))
+				if (SentryEnabled)
 				{
-					successMessages = Convert.ToBoolean(ConfigurationManager.AppSettings["SuccessMessages"]);
+					SentrySdk.ConfigureScope(scope =>
+					{
+						scope.SetTag("Environment.MachineName", System.Environment.MachineName);
+						scope.SetTag("BackupDir", ConfigurationManager.AppSettings["BackupDir"]);
+						scope.SetTag("ExcludedDBs", ConfigurationManager.AppSettings["ExcludedDBs"]);
+					});
 				}
 
-				var hostId = ConfigurationManager.AppSettings["HostID"];
 				var timer = Stopwatch.StartNew();
-
-				SentrySdk.ConfigureScope(scope =>
-				{
-					scope.SetTag("Environment.MachineName", System.Environment.MachineName);
-					scope.SetTag("BackupDir", ConfigurationManager.AppSettings["BackupDir"]);
-					scope.SetTag("ExcludedDBs", ConfigurationManager.AppSettings["ExcludedDBs"]);
-				});
 
 				#region Settings
 
@@ -118,10 +129,13 @@ namespace SQLAutoBackup
 								cmd.ExecuteNonQuery();
 							}
 
-							SentrySdk.ConfigureScope(scope =>
+							if (SentryEnabled)
 							{
-								scope.SetTag("databasesToBackup", string.Join(" ", databasesToBackup));
-							});
+								SentrySdk.ConfigureScope(scope =>
+								{
+									scope.SetTag("DBsToBackup", string.Join(";", databasesToBackup));
+								});
+							}
 						}
 					}
 
@@ -145,18 +159,22 @@ namespace SQLAutoBackup
 					var elapsedMs = timer.ElapsedMilliseconds;
 					decimal elapsedS = (decimal)elapsedMs / 1000;
 
-					if (successMessages)
+					var message = $"SQL DB backup on '{MachineName}' completed successfully in {elapsedS.ToString("0.00")}s!";
+					if (SuccessMessages && SentryEnabled)
 					{
-						SentrySdk.CaptureMessage($"Backup of {hostId} SQL databases completed successfully on {DateTime.Now.ToString("dd.MM.yyyy HH.mm")} in {elapsedS.ToString("0.00")}s!");
+						SentrySdk.CaptureMessage(message);
 					}
+					Console.WriteLine(message);
 				}
 				catch (Exception ex)
 				{
 					Console.ForegroundColor = ConsoleColor.Red;
 					Console.WriteLine($"Error: {ex.Message}");
-					Console.ReadLine();
 
-					SentrySdk.CaptureException(ex);
+					if (SentryEnabled)
+					{
+						SentrySdk.CaptureException(ex);
+					}
 				}
 				finally
 				{
